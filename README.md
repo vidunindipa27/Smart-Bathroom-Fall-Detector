@@ -11,8 +11,8 @@ A privacy-first, non-optical bathroom fall detection system powered by 24GHz mmW
 
 ```text
 ├── code/               # ESP32 C++ firmware (Triple-Lock state machine & Telegram dispatch)
-├── pcb_and_schematics/ # Custom PCB layout, schematics, and fabrication files
-└── report/             # Final project report (OFFSET_Final_Report.pdf)
+├── report/             # Final project report (OFFSET_Final_Report.pdf)
+└── pcb_and_schematics/ # Custom PCB layout, schematics, and fabrication files
 ```
 
 ---
