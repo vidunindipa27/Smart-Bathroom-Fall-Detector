@@ -1,0 +1,310 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+
+// ==========================================
+// PIN DEFINITIONS
+// ==========================================
+#define RADAR_RX_PIN 16
+#define RADAR_TX_PIN 17
+
+// ==========================================
+// WI-FI & TELEGRAM SETTINGS
+// ==========================================
+#define WIFI_SSID "S23 FE"
+#define WIFI_PASSWORD "vidun123"
+#define BOT_TOKEN "8817372699:AAHlaBEKXR4H2TCcdZ5iMlQ251tADka5YnU"
+#define CHAT_ID "8243465133"
+
+// ==========================================
+// MONITORING & HEARTBEAT SETTINGS
+// ==========================================
+unsigned long lastHeartbeatTime = 0;
+const unsigned long HEARTBEAT_INTERVAL = 86400000; // 24 hours Telegram text report
+
+unsigned long lastHealthchecksTime = 0;
+const unsigned long HEALTHCHECKS_INTERVAL = 60000; // 60 seconds ping
+const char* healthchecks_url = "https://hc-ping.com/42ac5db5-9269-4fef-a1e6-bece937388da"; 
+
+unsigned long lastSensorDataTime = 0;
+const unsigned long SENSOR_TIMEOUT = 5000; // 5 seconds without data = offline
+bool sensorOfflineAlertSent = false;
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+
+uint8_t radarBuf[29];
+
+// ==========================================
+// ADVANCED "TRIPLE-LOCK" + KINEMATIC GRADIENT 
+// ==========================================
+const int16_t FALL_TRIGGER_SPEED = -80;     // (cm/s) Fall initiation
+const float STOPPED_SPEED = 15.0;            // (cm/s) Speed considered "on the floor"
+const unsigned long MAX_DECAY_TIME = 1000;   // Maximum total time allowed for the fall sequence
+
+// Velocity Gradient (Deceleration) Limits
+const unsigned long MIN_IMPACT_TIME = 50;    // (ms) Faster than 50ms is a hand flick/noise
+const unsigned long MAX_IMPACT_TIME = 450;   // (ms) Slower than 450ms is a controlled muscle squat
+
+const unsigned long VERIFY_DURATION = 6000;  // 6 seconds to wait for recovery
+const float RECOVERY_SPEED_MIN = 15.0;       // Slow crawl cancels alarm
+const float FAST_STANDUP_SPEED = 40.0;       // Aggressive push up cancels instantly
+const unsigned long SUSTAINED_RECOVERY = 1500; 
+const float SMOOTHING_ALPHA = 0.7; 
+
+enum SystemState { IDLE, DECAY_CHECK, VERIFYING, ALARM };
+
+struct TargetSlot {
+  bool active = false;
+  float smoothedAbsSpeed = 0.0;
+  
+  SystemState currentState = IDLE;
+  unsigned long fallTriggerTime = 0; 
+  
+  // Gradient Trackers
+  int16_t peakNegativeSpeed = 0;
+  unsigned long peakSpeedTime = 0;
+
+  unsigned long verifyStartTime = 0;
+  unsigned long movementStartTime = 0; 
+  int plot_state = 0;
+  bool alertSent = false; 
+};
+
+TargetSlot targets[3];
+
+// ==========================================
+// HELPERS
+// ==========================================
+void clearRadarBuffer() {
+  while(Serial2.available()) {
+    Serial2.read();
+  }
+}
+
+void sendTelegramMessage(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Sending Telegram: " + message);
+    bot.sendMessage(CHAT_ID, message, "");
+    clearRadarBuffer(); 
+  } else {
+    Serial.println("Error: WiFi not connected. Cannot send: " + message);
+  }
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  delay(3000);
+  Serial.begin(115200);
+  Serial2.begin(256000, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN); 
+  
+  Serial.print("Connecting to WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(false); 
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT); 
+  
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    WiFi.setAutoReconnect(true);
+    sendTelegramMessage("✅ System Boot: Radar Sensor Armed.");
+  } else {
+    Serial.println("\nWiFi Failed to Connect.");
+  }
+
+  lastHeartbeatTime = millis(); 
+  lastHealthchecksTime = millis();
+  lastSensorDataTime = millis();
+  Serial.println("Starting Gradient-Aware Fall Detection...");
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  // 1. Standard 24-Hour Telegram Heartbeat
+  if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
+    sendTelegramMessage("💓 Heartbeat: System Operational & Monitoring.");
+    lastHeartbeatTime = millis();
+  }
+
+  // 2. 60-Second Invisible Internet Ping for Dead Man's Switch
+  if (millis() - lastHealthchecksTime >= HEALTHCHECKS_INTERVAL) {
+    lastHealthchecksTime = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.begin(healthchecks_url);
+      int httpResponseCode = http.GET();
+      if (httpResponseCode > 0) {
+        Serial.print("Healthchecks ping successful. Code: ");
+        Serial.println(httpResponseCode);
+      } else {
+        Serial.print("Healthchecks ping error: ");
+        Serial.println(httpResponseCode);
+      }
+      http.end();
+    } else {
+      Serial.println("Wi-Fi disconnected! Cannot ping Healthchecks server.");
+    }
+  }
+
+  // 3. Sensor Health Check (Offline Detection)
+  if (millis() - lastSensorDataTime > SENSOR_TIMEOUT) {
+    if (!sensorOfflineAlertSent) {
+      sendTelegramMessage("⚠️ WARNING: Radar Sensor Offline! No data received.");
+      sensorOfflineAlertSent = true;
+    }
+  }
+
+  // 4. Radar Sensor Processing Logic
+  if (Serial2.available() >= 29) {
+    if (Serial2.read() == 0xAA && Serial2.peek() == 0xFF) {
+      radarBuf[0] = 0xAA;
+      for (int i = 1; i < 29; i++) { radarBuf[i] = Serial2.read(); }
+
+      if (radarBuf[28] == 0x55) {
+        
+        // Reset Sensor Health Timer and notify if it reconnected
+        lastSensorDataTime = millis();
+        if (sensorOfflineAlertSent) {
+          sendTelegramMessage("✅ Radar Sensor Reconnected. Resuming monitoring.");
+          sensorOfflineAlertSent = false;
+        }
+
+        int global_plot_state = 0;
+        float max_speed_plot = 0.0;
+
+        for (int i = 0; i < 3; i++) {
+          int offset = 4 + (i * 8); 
+
+          int16_t y = radarBuf[offset+2] | (radarBuf[offset+3] << 8);
+          if (y & 0x8000) { y = -(y & 0x7FFF); } 
+
+          int16_t raw_speed = radarBuf[offset+4] | (radarBuf[offset+5] << 8);
+          if (raw_speed & 0x8000) { raw_speed = -(raw_speed & 0x7FFF); } 
+          
+          if (abs(y) > 0) {
+            targets[i].active = true;
+            float abs_speed = abs(raw_speed);
+            targets[i].smoothedAbsSpeed = (SMOOTHING_ALPHA * abs_speed) + ((1.0 - SMOOTHING_ALPHA) * targets[i].smoothedAbsSpeed);
+          } else {
+            targets[i].active = false;
+            targets[i].smoothedAbsSpeed = 0.0;
+          }
+
+          if (!targets[i].active && targets[i].currentState != ALARM) {
+             targets[i].currentState = IDLE;
+             targets[i].movementStartTime = 0;
+          } 
+          else if (targets[i].active) {
+            
+            switch (targets[i].currentState) {
+              
+              case IDLE:
+                targets[i].plot_state = 0;
+                if (raw_speed <= FALL_TRIGGER_SPEED) {
+                  targets[i].currentState = DECAY_CHECK;
+                  targets[i].fallTriggerTime = millis();
+                  targets[i].peakNegativeSpeed = raw_speed;
+                  targets[i].peakSpeedTime = millis();
+                }
+                break;
+
+              case DECAY_CHECK:
+                targets[i].plot_state = 250; 
+                
+                if (raw_speed < targets[i].peakNegativeSpeed) {
+                    targets[i].peakNegativeSpeed = raw_speed;
+                    targets[i].peakSpeedTime = millis();
+                }
+
+                if (targets[i].smoothedAbsSpeed < STOPPED_SPEED) {
+                  unsigned long fallDuration = millis() - targets[i].fallTriggerTime;
+                  unsigned long impactDuration = millis() - targets[i].peakSpeedTime;
+
+                  if (fallDuration <= MAX_DECAY_TIME) {
+                    if (impactDuration > MAX_IMPACT_TIME) {
+                        Serial.println("Filter: Controlled Squat Rejected");
+                        targets[i].currentState = IDLE;
+                    } 
+                    else if (impactDuration < MIN_IMPACT_TIME) {
+                        Serial.println("Filter: Hand Flick Rejected");
+                        targets[i].currentState = IDLE;
+                    } 
+                    else {
+                        targets[i].currentState = VERIFYING;
+                        targets[i].verifyStartTime = millis();
+                        targets[i].movementStartTime = 0; 
+                    }
+                  } else {
+                    targets[i].currentState = IDLE;
+                  }
+                }
+                else if (millis() - targets[i].fallTriggerTime > MAX_DECAY_TIME) {
+                    targets[i].currentState = IDLE; 
+                }
+                break;
+
+              case VERIFYING:
+                targets[i].plot_state = 500;
+                
+                if (raw_speed > FAST_STANDUP_SPEED) {
+                   targets[i].currentState = IDLE;
+                   targets[i].movementStartTime = 0;
+                }
+                else if (targets[i].smoothedAbsSpeed > RECOVERY_SPEED_MIN) {
+                  if (targets[i].movementStartTime == 0) {
+                    targets[i].movementStartTime = millis();
+                  } 
+                  else if (millis() - targets[i].movementStartTime >= SUSTAINED_RECOVERY) {
+                    targets[i].currentState = IDLE; 
+                    targets[i].movementStartTime = 0;
+                  }
+                } 
+                else {
+                  targets[i].movementStartTime = 0;
+                  if (millis() - targets[i].verifyStartTime >= VERIFY_DURATION) {
+                    targets[i].currentState = ALARM;
+                  }
+                }
+                break;
+
+              case ALARM:
+                targets[i].plot_state = 1500;
+                if (!targets[i].alertSent) {
+                  sendTelegramMessage("🚨 EMERGENCY: Fall Detected!");
+                  targets[i].alertSent = true; 
+                }
+                
+                if (targets[i].smoothedAbsSpeed > RECOVERY_SPEED_MIN) {
+                   targets[i].currentState = IDLE;
+                   targets[i].alertSent = false; 
+                }
+                break;
+            }
+          }
+
+          if (targets[i].plot_state > global_plot_state) { global_plot_state = targets[i].plot_state; }
+          if (targets[i].smoothedAbsSpeed > max_speed_plot) { max_speed_plot = targets[i].smoothedAbsSpeed; }
+        }
+
+        Serial.print("Min:-50,Max:1600,Max_Abs_Speed(cm/s):");
+        Serial.print(max_speed_plot);
+        Serial.print(",ALARM_STATE:");
+        Serial.println(global_plot_state);
+      }
+    }
+  }
+}
